@@ -71,6 +71,12 @@ $runStamp     = Get-Date -Format 'yyyyMMdd-HHmmss'
 $namespace    = "root\SMS\site_$SiteCode"
 $idPattern    = "\b$([regex]::Escape($SiteCode))[0-9A-Fa-f]{5}\b"
 
+# Resolve to full file system paths now. The script later switches to the CM site drive,
+# where relative paths would no longer point at the file system.
+$InputPath    = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($InputPath)
+$BackupFolder = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($BackupFolder)
+$LogPath      = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($LogPath)
+
 # ---------- helpers ----------
 
 function Write-Log {
@@ -118,6 +124,8 @@ try {
     if (-not (Get-PSDrive -Name $SiteCode -ErrorAction SilentlyContinue)) {
         New-PSDrive -Name $SiteCode -PSProvider CMSite -Root $SiteServer | Out-Null
     }
+    # The CM cmdlets only run from the site drive. Pop-Location in finally restores the caller's location.
+    Set-Location "$($SiteCode):"
 
     # Build the live reference map once: target ID -> list of referencing collection IDs.
     Write-Host 'Building live reference map...'
