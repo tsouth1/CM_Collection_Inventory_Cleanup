@@ -1,0 +1,245 @@
+<#
+.SYNOPSIS
+    Exports an inventory of all Configuration Manager collections to CSV, plus a
+    structured list of collection-to-collection references.
+
+.DESCRIPTION
+    Read-only. Queries the SMS Provider (WMI) and writes:
+
+    1. <OutputPath>             one row per collection with name, ID, type, member count,
+                                limiting collection, include/exclude rules, query rules,
+                                direct rule count, deployments, refresh (evaluation) settings,
+                                audit timestamps, comment, and the collections that reference it.
+    2. <OutputPath>_References  one row per reference: source collection, reference type
+                                (Limiting / Include / Exclude / Query), and target collection.
+
+    Reference types:
+      Limiting, Include, Exclude  taken from the membership rule objects (exact IDs).
+      Query                       a collection ID found inside a query rule's WQL text.
+                                  Matched by ID pattern, so review these before acting on them.
+
+    Multi-value cells are separated by " | ". Each referenced collection is written
+    as "Name (ID)".
+
+    Part of Phase 1 (Discovery) / Skill 1 (Collection Inventory) in the project plan.
+
+.PARAMETER SiteServer
+    Server hosting the SMS Provider. Defaults to the local computer.
+
+.PARAMETER SiteCode
+    Site code. Detected from the SMS Provider when omitted.
+
+.PARAMETER OutputPath
+    CSV file to write. Defaults to Data\CollectionInventory_<yyyyMMdd-HHmm>.csv in the repo.
+    The references file is written alongside it with a _References suffix.
+
+.EXAMPLE
+    .\Collection-Inventory.v2.ps1 -SiteServer CM01.contoso.com
+
+.EXAMPLE
+    .\Collection-Inventory.v2.ps1 -SiteServer CM01 -SiteCode PS1 -OutputPath C:\Temp\collections.csv
+#>
+[CmdletBinding()]
+param(
+    [string]$SiteServer = $env:COMPUTERNAME,
+    [string]$SiteCode = 'LEA',
+    [string]$OutputPath = (Join-Path $PSScriptRoot "..\Data\CollectionInventory_$(Get-Date -Format 'yyyyMMdd-HHmm').csv")
+)
+
+$ErrorActionPreference = 'Stop'
+$Separator = ' | '
+
+# SMS_DeploymentSummary.FeatureType values
+$FeatureTypes = @{
+    1  = 'Application'
+    2  = 'Package/Program'
+    3  = 'Mobile Program'
+    4  = 'Script'
+    5  = 'Software Update'
+    6  = 'Configuration Baseline'
+    7  = 'Task Sequence'
+    8  = 'Content Distribution'
+    9  = 'Distribution Point Group'
+    10 = 'Distribution Point Health'
+    11 = 'Configuration Policy'
+}
+
+# SMS_Collection.RefreshType values. Incremental evaluation is bit 4 (4 or 6).
+$RefreshTypes = @{
+    1 = 'Manual'
+    2 = 'Scheduled (full)'
+    4 = 'Incremental'
+    6 = 'Scheduled (full) + Incremental'
+}
+
+# DCOM is what the CM console uses, so it works wherever the console can connect.
+$session = New-CimSession -ComputerName $SiteServer -SessionOption (New-CimSessionOption -Protocol Dcom)
+
+try {
+    if (-not $SiteCode) {
+        $SiteCode = (Get-CimInstance -CimSession $session -Namespace 'root\SMS' -ClassName SMS_ProviderLocation |
+            Where-Object ProviderForLocalSite | Select-Object -First 1).SiteCode
+        if (-not $SiteCode) { throw "Could not detect the site code on $SiteServer. Pass -SiteCode." }
+    }
+    $namespace = "root\SMS\site_$SiteCode"
+    Write-Verbose "Connected to $SiteServer, namespace $namespace"
+
+    # Collection IDs are the site code followed by five hex characters, e.g. LEA011AE.
+    $idPattern = "\b$([regex]::Escape($SiteCode))[0-9A-Fa-f]{5}\b"
+
+    # Get all collections
+$collections = @(Get-CimInstance -CimSession $session -Namespace $namespace -ClassName SMS_Collection)
+
+# SCCM built-in (canned) collections typically have CollectionID ending in 00001-0000A
+# Exclude:
+#   - Collections containing '-sec' in the name
+#   - Collections limited to collection ID LEA013D0
+#   - Default SCCM collections
+
+$collections = $collections | Where-Object {
+    $_.Name -notmatch '(?i)-sec' -and
+    $_.LimitToCollectionID -ne 'LEA013D0' -and
+    $_.CollectionID -notmatch "^$($SiteCode)0000[1-9A-Fa-f]$"
+}
+
+Write-Verbose "Found $($collections.Count) collections after exclusions"
+
+    $namesById = @{}
+    foreach ($c in $collections) { $namesById[$c.CollectionID] = $c.Name }
+
+    function Format-CollectionRef([string]$Id) {
+        $name = $namesById[$Id]
+        if ($name) { "$name ($Id)" } else { "<unknown> ($Id)" }
+    }
+
+    # Structured reference tracking. Filled during the main loop, read after it.
+    $references   = New-Object System.Collections.Generic.List[pscustomobject]
+    $referencedBy = @{}   # target ID -> list of "Name (ID) [RefType]" strings
+
+    function Add-Reference([string]$SourceId, [string]$TargetId, [string]$RefType, [string]$Detail) {
+        if (-not $TargetId -or $TargetId -eq $SourceId) { return }
+        $references.Add([pscustomobject]@{
+            SourceID      = $SourceId
+            SourceName    = $namesById[$SourceId]
+            ReferenceType = $RefType
+            TargetID      = $TargetId
+            TargetName    = $namesById[$TargetId]
+            Detail        = $Detail
+        })
+        if (-not $referencedBy.ContainsKey($TargetId)) {
+            $referencedBy[$TargetId] = New-Object System.Collections.Generic.List[string]
+        }
+        $referencedBy[$TargetId].Add("$($namesById[$SourceId]) ($SourceId) [$RefType]")
+    }
+
+    # One query for all deployments, grouped by target collection.
+    $deploymentsById = @{}
+    foreach ($d in Get-CimInstance -CimSession $session -Namespace $namespace -ClassName SMS_DeploymentSummary) {
+        $type = $FeatureTypes[[int]$d.FeatureType]
+        if (-not $type) { $type = "FeatureType $($d.FeatureType)" }
+        if (-not $deploymentsById.ContainsKey($d.CollectionID)) {
+            $deploymentsById[$d.CollectionID] = New-Object System.Collections.Generic.List[string]
+        }
+        $deploymentsById[$d.CollectionID].Add("$type`: $($d.SoftwareName)")
+    }
+
+    $rows = for ($i = 0; $i -lt $collections.Count; $i++) {
+        $c = $collections[$i]
+        Write-Progress -Activity 'Reading collection rules' -Status "$($c.Name) ($($c.CollectionID))" `
+            -PercentComplete (($i / $collections.Count) * 100)
+
+        # CollectionRules is a lazy property: it is only returned when the instance is read individually.
+        $rules = @(($c | Get-CimInstance).CollectionRules)
+
+        if ($c.LimitToCollectionID) {
+            Add-Reference $c.CollectionID $c.LimitToCollectionID 'Limiting' ''
+        }
+
+        $includes = @(); $excludes = @(); $queries = @(); $directCount = 0
+        foreach ($rule in $rules) {
+            switch ($rule.CimClass.CimClassName) {
+                'SMS_CollectionRuleIncludeCollection' {
+                    $includes += Format-CollectionRef $rule.IncludeCollectionID
+                    Add-Reference $c.CollectionID $rule.IncludeCollectionID 'Include' ''
+                }
+                'SMS_CollectionRuleExcludeCollection' {
+                    $excludes += Format-CollectionRef $rule.ExcludeCollectionID
+                    Add-Reference $c.CollectionID $rule.ExcludeCollectionID 'Exclude' ''
+                }
+                'SMS_CollectionRuleQuery' {
+                    # Collapse whitespace so each query stays on one line in the CSV.
+                    $queries += "$($rule.RuleName): $($rule.QueryExpression -replace '\s+', ' ')"
+                    foreach ($m in [regex]::Matches($rule.QueryExpression, $idPattern)) {
+                        $target = $m.Value.ToUpper()
+                        if ($namesById.ContainsKey($target)) {
+                            Add-Reference $c.CollectionID $target 'Query' $rule.RuleName
+                        }
+                    }
+                }
+                'SMS_CollectionRuleDirect' { $directCount++ }
+            }
+        }
+
+        $deployments = @($deploymentsById[$c.CollectionID] | Where-Object { $_ })
+
+        $refreshName = $RefreshTypes[[int]$c.RefreshType]
+        if (-not $refreshName) { $refreshName = "Unknown ($($c.RefreshType))" }
+
+        [pscustomobject]@{
+            CollectionName       = $c.Name
+            CollectionID         = $c.CollectionID
+            Type                 = switch ($c.CollectionType) { 1 { 'User' } 2 { 'Device' } default { 'Other' } }
+            MemberCount          = $c.MemberCount
+            LimitingCollection   = if ($c.LimitToCollectionID) { Format-CollectionRef $c.LimitToCollectionID } else { '' }
+            IncludeCount         = $includes.Count
+            IncludeCollections   = $includes -join $Separator
+            ExcludeCount         = $excludes.Count
+            ExcludeCollections   = $excludes -join $Separator
+            DeploymentCount      = $deployments.Count
+            Deployments          = $deployments -join $Separator
+            QueryRuleCount       = $queries.Count
+            QueryRules           = $queries -join $Separator
+            DirectRuleCount      = $directCount
+            RefreshType          = [int]$c.RefreshType
+            EvaluationMode       = $refreshName
+            IsIncremental        = (([int]$c.RefreshType) -band 4) -eq 4
+            LastRefreshTime      = $c.LastRefreshTime
+            LastMemberChangeTime = $c.LastMemberChangeTime
+            LastChangeTime       = $c.LastChangeTime
+            Comment              = $c.Comment
+        }
+    }
+    Write-Progress -Activity 'Reading collection rules' -Completed
+
+    # Second pass: references are complete now, so add the reverse lookup to each row.
+    # The blank review column goes first so it is easy to find when marking rows in Excel.
+    # Enter Y in that column to mark a collection for deletion (see Delete-MarkedCollections.ps1).
+    $results = foreach ($row in $rows) {
+        $list  = $referencedBy[$row.CollectionID]
+        $count = if ($list) { $list.Count } else { 0 }
+        $row | Add-Member -NotePropertyName ReferencedByCount -NotePropertyValue $count -PassThru |
+            Add-Member -NotePropertyName ReferencedBy -NotePropertyValue (@($list) -join $Separator) -PassThru |
+            Select-Object @{ Name = 'to be deleted'; Expression = { '' } }, *
+    }
+
+    $outDir = Split-Path -Parent $OutputPath
+    if ($outDir -and -not (Test-Path $outDir)) { New-Item -ItemType Directory -Path $outDir | Out-Null }
+
+    $results | Sort-Object CollectionName | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
+
+    $refPath = Join-Path $outDir ([IO.Path]::GetFileNameWithoutExtension($OutputPath) + '_References.csv')
+    if ($references.Count -gt 0) {
+        $references | Sort-Object SourceName, ReferenceType, TargetName |
+            Export-Csv -Path $refPath -NoTypeInformation -Encoding UTF8
+    } else {
+        Write-Warning 'No references found; references file not written.'
+    }
+
+    $incrementalCount = @($results | Where-Object { $_.IsIncremental }).Count
+    Write-Host "Exported $(@($results).Count) collections to $((Resolve-Path $OutputPath).Path)"
+    Write-Host "Exported $($references.Count) references to $refPath"
+    Write-Host "Incremental evaluation enabled on $incrementalCount collections."
+}
+finally {
+    Remove-CimSession $session
+}
