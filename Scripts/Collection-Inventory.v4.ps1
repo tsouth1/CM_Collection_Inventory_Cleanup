@@ -6,10 +6,11 @@
 .DESCRIPTION
     Read-only. Queries the SMS Provider (WMI) and writes:
 
-    1. <OutputPath>             one row per collection with name, ID, type, member count,
-                                limiting collection, include/exclude rules, query rules,
-                                direct rule count, deployments, refresh (evaluation) settings,
-                                audit timestamps, comment, and the collections that reference it.
+    1. <OutputPath>             one row per collection with name, the collections that reference
+                                it (one column per reference type), console folder, ID, type,
+                                member count, limiting collection, include/exclude rules, query
+                                rules, direct rule count, deployments (one column per deployment
+                                type), refresh (evaluation) settings, audit timestamps and comment.
     2. <OutputPath>_References  one row per reference: source collection, reference type
                                 (Limiting / Include / Exclude / Query), and target collection.
 
@@ -18,12 +19,17 @@
       Query                       a collection ID found inside a query rule's WQL text.
                                   Matched by ID pattern, so review these before acting on them.
 
+    Deployments come from SMS_DeploymentSummary (applications, packages, updates, baselines,
+    task sequences, ...) plus client settings and antimalware policy deployments, which are
+    stored separately in SMS_ClientSettingsAssignment. DeploymentCount is the total of all of them.
+
     Multi-value cells are separated by " | ". Each referenced collection is written
     as "Name (ID)". ObjectPath is the collection's folder in the console, for example
     "Device Collections\Workstations\Office".
 
     Exclusions. These collections are left out of the inventory CSV:
       - Built-in collections (IDs starting with SMS).
+      - Collections in a console folder matching an -ExcludeFolder pattern.
       - Collections whose name ends with an -ExcludeNameSuffix value.
       - Collections limited to an -ExcludeLimitedTo collection ID.
     Excluded collections are still read, so their references to other collections count in
@@ -41,6 +47,13 @@
     CSV file to write. Defaults to Data\CollectionInventory_<yyyyMMdd-HHmm>.csv in the repo.
     The references file is written alongside it with a _References suffix.
 
+.PARAMETER ExcludeFolder
+    Leave out collections in console folders matching any of these patterns (not case-sensitive).
+    Use * as a wildcard: "...\Office 365*" matches "Office 365", "Office 365 Apps" and every
+    folder below them. Paths may start with "Device Collections\" or with the full console path
+    "\Assets and Compliance\Overview\Device Collections\". Defaults to the Office 365 and
+    Security Patches deployment folders. Pass @() to turn this exclusion off.
+
 .PARAMETER ExcludeNameSuffix
     Leave out collections whose name ends with any of these values (not case-sensitive).
     Defaults to -sec. Pass @() to turn this exclusion off.
@@ -50,19 +63,26 @@
     Defaults to LEA013D0. Pass @() to turn this exclusion off.
 
 .EXAMPLE
-    .\Collection-Inventory.v2.ps1 -SiteServer CM01.contoso.com
+    .\Collection-Inventory.v4.ps1 -SiteServer CM01.contoso.com
 
 .EXAMPLE
-    .\Collection-Inventory.v2.ps1 -SiteServer CM01 -SiteCode PS1 -OutputPath C:\Temp\collections.csv
+    .\Collection-Inventory.v4.ps1 -SiteServer CM01 -SiteCode PS1 -OutputPath C:\Temp\collections.csv
 
 .EXAMPLE
-    .\Collection-Inventory.v2.ps1 -SiteServer CM01 -SiteCode PS1 -ExcludeNameSuffix '-sec', '-test' -ExcludeLimitedTo @()
+    .\Collection-Inventory.v4.ps1 -SiteServer CM01 -SiteCode PS1 -ExcludeNameSuffix '-sec', '-test' -ExcludeLimitedTo @()
+
+.EXAMPLE
+    .\Collection-Inventory.v4.ps1 -SiteServer CM01 -SiteCode PS1 -ExcludeFolder 'Device Collections\Deployment\Pilot*'
 #>
 [CmdletBinding()]
 param(
     [string]$SiteServer = $env:COMPUTERNAME,
     [string]$SiteCode = 'LEA',
     [string]$OutputPath = (Join-Path $PSScriptRoot "..\Data\CollectionInventory_$(Get-Date -Format 'yyyyMMdd-HHmm').csv"),
+    [string[]]$ExcludeFolder = @(
+        'Device Collections\Deployment\Software Center Deployments\Office 365*'
+        'Device Collections\Deployment\Security Patches*'
+    ),
     [string[]]$ExcludeNameSuffix = @('-sec'),
     [string[]]$ExcludeLimitedTo  = @('LEA013D0')
 )
@@ -84,6 +104,27 @@ $FeatureTypes = @{
     10 = 'Distribution Point Health'
     11 = 'Configuration Policy'
 }
+
+# Client settings deployments (SMS_ClientSettingsAssignment), by the settings object's class.
+$ClientSettingsTypes = @{
+    'SMS_ClientSettings'      = 'Custom Client Settings'
+    'SMS_AntimalwareSettings' = 'Antimalware Policy'
+}
+
+# One "Deployments - <type>" column per type, always in this order so CSVs from different runs
+# line up. Deployments of any type not listed here go in "Deployments - Other".
+$DeploymentColumns = @(
+    'Application', 'Package/Program', 'Software Update', 'Configuration Baseline', 'Configuration Policy',
+    'Task Sequence', 'Script', 'Custom Client Settings', 'Antimalware Policy', 'Content Distribution',
+    'Distribution Point Group', 'Distribution Point Health', 'Mobile Program', 'Other'
+)
+
+$ReferenceTypes = 'Limiting', 'Include', 'Exclude', 'Query'
+
+# Folder patterns are compared with the ObjectPath column, which starts at "Device Collections".
+$folderPatterns = @($ExcludeFolder | Where-Object { $_ } | ForEach-Object {
+    ($_.Trim() -replace '/', '\').TrimStart('\') -replace '^Assets and Compliance\\Overview\\', ''
+})
 
 # SMS_Collection.RefreshType values. Incremental evaluation is bit 4 (4 or 6).
 $RefreshTypes = @{
@@ -130,10 +171,14 @@ try {
     # Decide exclusions up front. Excluded collections are still read below for their
     # references, but get no row in the CSV.
     $excludedReason = @{}   # collection ID -> reason
+    $pathById       = @{}
     foreach ($c in $collections) {
         $name = "$($c.Name)".TrimEnd()
+        $path = Format-ConsolePath $c
+        $pathById[$c.CollectionID] = $path
         $reason =
             if ($c.CollectionID -like 'SMS*') { 'Built-in' }
+            elseif (@($folderPatterns | Where-Object { $path -like $_ }).Count) { 'Folder' }
             elseif (@($ExcludeNameSuffix | Where-Object { $_ -and $name.EndsWith($_, [StringComparison]::OrdinalIgnoreCase) }).Count) { 'Name suffix' }
             elseif ($c.LimitToCollectionID -and $ExcludeLimitedTo -contains $c.LimitToCollectionID) { 'Limiting collection' }
         if ($reason) { $excludedReason[$c.CollectionID] = $reason }
@@ -141,7 +186,7 @@ try {
 
     # Structured reference tracking. Filled during the main loop, read after it.
     $references   = New-Object System.Collections.Generic.List[pscustomobject]
-    $referencedBy = @{}   # target ID -> list of "Name (ID) [RefType]" strings
+    $referencedBy = @{}   # target ID -> list of { Type; Ref = "Name (ID)" }
 
     function Add-Reference([string]$SourceId, [string]$TargetId, [string]$RefType, [string]$Detail) {
         if (-not $TargetId -or $TargetId -eq $SourceId) { return }
@@ -154,20 +199,39 @@ try {
             Detail        = $Detail
         })
         if (-not $referencedBy.ContainsKey($TargetId)) {
-            $referencedBy[$TargetId] = New-Object System.Collections.Generic.List[string]
+            $referencedBy[$TargetId] = New-Object System.Collections.Generic.List[pscustomobject]
         }
-        $referencedBy[$TargetId].Add("$($namesById[$SourceId]) ($SourceId) [$RefType]")
+        $referencedBy[$TargetId].Add([pscustomobject]@{ Type = $RefType; Ref = Format-CollectionRef $SourceId })
     }
 
-    # One query for all deployments, grouped by target collection.
+    # Deployments by target collection: collection ID -> list of { Type; Name }.
+    # Type is one of $DeploymentColumns; unknown types go to Other with their raw type in Name.
     $deploymentsById = @{}
+    function Add-Deployment([string]$CollectionId, [string]$Type, [string]$Name) {
+        if (-not $deploymentsById.ContainsKey($CollectionId)) {
+            $deploymentsById[$CollectionId] = New-Object System.Collections.Generic.List[pscustomobject]
+        }
+        $deploymentsById[$CollectionId].Add([pscustomobject]@{ Type = $Type; Name = $Name })
+    }
+
     foreach ($d in Get-CimInstance -CimSession $session -Namespace $namespace -ClassName SMS_DeploymentSummary) {
         $type = $FeatureTypes[[int]$d.FeatureType]
-        if (-not $type) { $type = "FeatureType $($d.FeatureType)" }
-        if (-not $deploymentsById.ContainsKey($d.CollectionID)) {
-            $deploymentsById[$d.CollectionID] = New-Object System.Collections.Generic.List[string]
-        }
-        $deploymentsById[$d.CollectionID].Add("$type`: $($d.SoftwareName)")
+        if ($type) { Add-Deployment $d.CollectionID $type $d.SoftwareName }
+        else       { Add-Deployment $d.CollectionID 'Other' "FeatureType $($d.FeatureType): $($d.SoftwareName)" }
+    }
+
+    # Client settings and antimalware policies are not in SMS_DeploymentSummary.
+    # SMS_ClientSettingsBase returns both kinds; the class tells them apart.
+    $settingsById = @{}
+    foreach ($cs in Get-CimInstance -CimSession $session -Namespace $namespace -ClassName SMS_ClientSettingsBase) {
+        $settingsById[[uint32]$cs.SettingsID] = $cs
+    }
+    foreach ($a in Get-CimInstance -CimSession $session -Namespace $namespace -ClassName SMS_ClientSettingsAssignment) {
+        $cs   = $settingsById[[uint32]$a.ClientSettingsID]
+        $name = if ($cs) { $cs.Name } else { "<unknown settings> ($($a.ClientSettingsID))" }
+        $type = if ($cs) { $ClientSettingsTypes[$cs.CimClass.CimClassName] }
+        if ($type) { Add-Deployment $a.CollectionID $type $name }
+        else       { Add-Deployment $a.CollectionID 'Other' "Client settings: $name" }
     }
 
     $rows = for ($i = 0; $i -lt $collections.Count; $i++) {
@@ -215,34 +279,37 @@ try {
         $refreshName = $RefreshTypes[[int]$c.RefreshType]
         if (-not $refreshName) { $refreshName = "Unknown ($($c.RefreshType))" }
 
-        # ReferencedByCount and ReferencedBy are filled in the second pass. They sit next to
-        # the name so the dependency check is visible while reviewing.
-        [pscustomobject]@{
-            CollectionName       = $c.Name
-            ReferencedByCount    = 0
-            ReferencedBy         = ''
-            ObjectPath           = Format-ConsolePath $c
-            CollectionID         = $c.CollectionID
-            Type                 = switch ($c.CollectionType) { 1 { 'User' } 2 { 'Device' } default { 'Other' } }
-            MemberCount          = $c.MemberCount
-            LimitingCollection   = if ($c.LimitToCollectionID) { Format-CollectionRef $c.LimitToCollectionID } else { '' }
-            IncludeCount         = $includes.Count
-            IncludeCollections   = $includes -join $Separator
-            ExcludeCount         = $excludes.Count
-            ExcludeCollections   = $excludes -join $Separator
-            DeploymentCount      = $deployments.Count
-            Deployments          = $deployments -join $Separator
-            QueryRuleCount       = $queries.Count
-            QueryRules           = $queries -join $Separator
-            DirectRuleCount      = $directCount
-            RefreshType          = [int]$c.RefreshType
-            EvaluationMode       = $refreshName
-            IsIncremental        = (([int]$c.RefreshType) -band 4) -eq 4
-            LastRefreshTime      = $c.LastRefreshTime
-            LastMemberChangeTime = $c.LastMemberChangeTime
-            LastChangeTime       = $c.LastChangeTime
-            Comment              = $c.Comment
+        # The ReferencedBy columns are filled in the second pass. They sit next to the name
+        # so the dependency check is visible while reviewing.
+        $row = [ordered]@{
+            CollectionName    = $c.Name
+            ReferencedByCount = 0
         }
+        foreach ($t in $ReferenceTypes) { $row["ReferencedBy-$t"] = '' }
+        $row.ObjectPath         = $pathById[$c.CollectionID]
+        $row.CollectionID       = $c.CollectionID
+        $row.Type               = switch ($c.CollectionType) { 1 { 'User' } 2 { 'Device' } default { 'Other' } }
+        $row.MemberCount        = $c.MemberCount
+        $row.LimitingCollection = if ($c.LimitToCollectionID) { Format-CollectionRef $c.LimitToCollectionID } else { '' }
+        $row.IncludeCount       = $includes.Count
+        $row.IncludeCollections = $includes -join $Separator
+        $row.ExcludeCount       = $excludes.Count
+        $row.ExcludeCollections = $excludes -join $Separator
+        $row.DeploymentCount    = $deployments.Count
+        foreach ($t in $DeploymentColumns) {
+            $row["Deployments - $t"] = @($deployments | Where-Object Type -eq $t | ForEach-Object Name) -join $Separator
+        }
+        $row.QueryRuleCount       = $queries.Count
+        $row.QueryRules           = $queries -join $Separator
+        $row.DirectRuleCount      = $directCount
+        $row.RefreshType          = [int]$c.RefreshType
+        $row.EvaluationMode       = $refreshName
+        $row.IsIncremental        = (([int]$c.RefreshType) -band 4) -eq 4
+        $row.LastRefreshTime      = $c.LastRefreshTime
+        $row.LastMemberChangeTime = $c.LastMemberChangeTime
+        $row.LastChangeTime       = $c.LastChangeTime
+        $row.Comment              = $c.Comment
+        [pscustomobject]$row
     }
     Write-Progress -Activity 'Reading collection rules' -Completed
 
@@ -250,9 +317,11 @@ try {
     # The blank review column goes first so it is easy to find when marking rows in Excel.
     # Enter Y in that column to mark a collection for deletion (see Delete-MarkedCollections.ps1).
     $results = foreach ($row in $rows) {
-        $list = $referencedBy[$row.CollectionID]
-        $row.ReferencedByCount = if ($list) { $list.Count } else { 0 }
-        $row.ReferencedBy      = @($list) -join $Separator
+        $list = @($referencedBy[$row.CollectionID] | Where-Object { $_ })
+        $row.ReferencedByCount = $list.Count
+        foreach ($t in $ReferenceTypes) {
+            $row."ReferencedBy-$t" = @($list | Where-Object Type -eq $t | ForEach-Object Ref) -join $Separator
+        }
         $row | Select-Object @{ Name = 'to be deleted'; Expression = { '' } }, *
     }
 

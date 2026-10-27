@@ -10,7 +10,7 @@ The workflow has three steps:
 
 | Script | Purpose | Changes the site? |
 |---|---|---|
-| `Scripts\Collection-Inventory.v2.ps1` | Exports the collection inventory | No (read-only) |
+| `Scripts\Collection-Inventory.v4.ps1` | Exports the collection inventory | No (read-only) |
 | `Scripts\Delete-MarkedCollections.ps1` | Deletes collections marked `Y` in the inventory CSV | Only with `-Execute` |
 
 ## Requirements
@@ -26,7 +26,7 @@ Running both scripts on the site server itself (with `-SiteServer localhost`) me
 
 ```powershell
 cd .\Scripts
-.\Collection-Inventory.v2.ps1 -SiteServer CM01.contoso.com -SiteCode PS1
+.\Collection-Inventory.v4.ps1 -SiteServer CM01.contoso.com -SiteCode PS1
 ```
 
 | Parameter | Default | Description |
@@ -34,6 +34,7 @@ cd .\Scripts
 | `-SiteServer` | This computer | Server hosting the SMS Provider. |
 | `-SiteCode` | `LEA` | Site code. **Always pass this** when targeting any site other than LEA. To detect the site code from the provider instead, pass `-SiteCode ''`. |
 | `-OutputPath` | `Data\CollectionInventory_<yyyyMMdd-HHmm>.csv` | Inventory CSV to write. |
+| `-ExcludeFolder` | The Office 365 and Security Patches deployment folders (see [Exclusions](#exclusions)) | Leave out collections in console folders matching any of these patterns. `@()` turns it off. |
 | `-ExcludeNameSuffix` | `-sec` | Leave out collections whose name ends with any of these values (not case-sensitive). `@()` turns it off. |
 | `-ExcludeLimitedTo` | `LEA013D0` | Leave out collections limited to any of these collection IDs. `@()` turns it off. |
 
@@ -45,12 +46,19 @@ The script writes two files:
   |---|---|
   | `to be deleted` | Blank, for you to fill in |
   | `CollectionName` | |
-  | `ReferencedByCount` | Number of collections that depend on this one |
-  | `ReferencedBy` | Those collections, with the type of reference |
+  | `ReferencedByCount` | Total number of references to this collection |
+  | `ReferencedBy-Limiting` | Collections limited to this one |
+  | `ReferencedBy-Include` | Collections that include this one |
+  | `ReferencedBy-Exclude` | Collections that exclude this one |
+  | `ReferencedBy-Query` | Collections whose query rules contain this collection's ID |
   | `ObjectPath` | Folder in the console, e.g. `Device Collections\Workstations\Office` |
   | `CollectionID` | |
 
-  These are followed by the type, member count, limiting collection, include/exclude/query/direct rules, deployments, evaluation schedule, incremental evaluation, last refresh/change times and comment.
+  These are followed by the type, member count, limiting collection and include/exclude rules. Next come `DeploymentCount` (the total) and one `Deployments - <type>` column for each deployment type:
+
+  > Application, Package/Program, Software Update, Configuration Baseline, Configuration Policy, Task Sequence, Script, **Custom Client Settings**, **Antimalware Policy**, Content Distribution, Distribution Point Group, Distribution Point Health, Mobile Program, Other
+
+  Every column is always present, even when empty, so CSVs from different runs line up. Custom client settings and antimalware policy deployments are read from `SMS_ClientSettingsAssignment`, because they don't appear with other deployments. The remaining columns are query/direct rules, evaluation schedule, incremental evaluation, last refresh/change times and comment.
 - **`CollectionInventory_<timestamp>_References.csv`**: one row per collection-to-collection reference: `Limiting`, `Include`, `Exclude`, or `Query` (a collection ID found in a query rule's WQL text).
 
 Cells with several values are separated by ` | `, and referenced collections are written as `Name (ID)`. A limiting collection that no longer exists shows as `<unknown> (ID)`.
@@ -60,15 +68,20 @@ Cells with several values are separated by ` | `, and referenced collections are
 These collections are left out of the inventory CSV, so they can't be marked for deletion:
 
 - built-in collections (IDs starting with `SMS`),
+- collections in these console folders, including every folder below them:
+  - `Device Collections\Deployment\Software Center Deployments\Office 365*`
+  - `Device Collections\Deployment\Security Patches*`
+
+  `*` is a wildcard, so `Office 365*` also matches `Office 365 Apps` and `Office 365 Apps\Pilot`. `-ExcludeFolder` accepts paths starting with `Device Collections\` or with the full console path (`\Assets and Compliance\Overview\Device Collections\...`).
 - collections whose name ends with `-sec` (`HR-sec`, `Finance-SEC`; not `App-Security`),
 - collections limited to `LEA013D0`.
 
-Excluded collections are still read for their references. If an excluded collection uses another collection, that collection's `ReferencedBy` still lists it and it won't look unused. The console summary shows how many collections were excluded and why.
+Excluded collections are still read for their references. If an excluded collection uses another collection, that collection's `ReferencedBy-*` columns still list it and it won't look unused. The console summary shows how many collections were excluded and why.
 
 Example: also exclude names ending in `-test`, and turn off the limiting collection exclusion:
 
 ```powershell
-.\Collection-Inventory.v2.ps1 -SiteServer CM01.contoso.com -SiteCode PS1 -ExcludeNameSuffix '-sec', '-test' -ExcludeLimitedTo @()
+.\Collection-Inventory.v4.ps1 -SiteServer CM01.contoso.com -SiteCode PS1 -ExcludeNameSuffix '-sec', '-test' -ExcludeLimitedTo @()
 ```
 
 ## 2. Review
@@ -108,7 +121,7 @@ The CSV can be out of date, so every marked row is checked against the live site
 
 - it is a built-in collection (ID starts with `SMS`),
 - the collection no longer exists, or its name differs from the CSV (re-run the inventory),
-- it has any deployment,
+- it has any deployment, including custom client settings and antimalware policy deployments,
 - another collection references it as a limiting, include or exclude collection, or by ID in a query rule,
 - its collection ID appears more than once in the CSV.
 
