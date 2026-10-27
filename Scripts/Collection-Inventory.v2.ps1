@@ -19,7 +19,15 @@
                                   Matched by ID pattern, so review these before acting on them.
 
     Multi-value cells are separated by " | ". Each referenced collection is written
-    as "Name (ID)".
+    as "Name (ID)". ObjectPath is the collection's folder in the console, for example
+    "Device Collections\Workstations\Office".
+
+    Exclusions. These collections are left out of the inventory CSV:
+      - Built-in collections (IDs starting with SMS).
+      - Collections whose name ends with an -ExcludeNameSuffix value.
+      - Collections limited to an -ExcludeLimitedTo collection ID.
+    Excluded collections are still read, so their references to other collections count in
+    ReferencedBy and the references file. A collection used by an excluded one never looks unused.
 
     Part of Phase 1 (Discovery) / Skill 1 (Collection Inventory) in the project plan.
 
@@ -27,23 +35,36 @@
     Server hosting the SMS Provider. Defaults to the local computer.
 
 .PARAMETER SiteCode
-    Site code. Detected from the SMS Provider when omitted.
+    Site code. Defaults to LEA. Pass an empty string to detect it from the SMS Provider.
 
 .PARAMETER OutputPath
     CSV file to write. Defaults to Data\CollectionInventory_<yyyyMMdd-HHmm>.csv in the repo.
     The references file is written alongside it with a _References suffix.
+
+.PARAMETER ExcludeNameSuffix
+    Leave out collections whose name ends with any of these values (not case-sensitive).
+    Defaults to -sec. Pass @() to turn this exclusion off.
+
+.PARAMETER ExcludeLimitedTo
+    Leave out collections whose limiting collection is any of these IDs.
+    Defaults to LEA013D0. Pass @() to turn this exclusion off.
 
 .EXAMPLE
     .\Collection-Inventory.v2.ps1 -SiteServer CM01.contoso.com
 
 .EXAMPLE
     .\Collection-Inventory.v2.ps1 -SiteServer CM01 -SiteCode PS1 -OutputPath C:\Temp\collections.csv
+
+.EXAMPLE
+    .\Collection-Inventory.v2.ps1 -SiteServer CM01 -SiteCode PS1 -ExcludeNameSuffix '-sec', '-test' -ExcludeLimitedTo @()
 #>
 [CmdletBinding()]
 param(
     [string]$SiteServer = $env:COMPUTERNAME,
     [string]$SiteCode = 'LEA',
-    [string]$OutputPath = (Join-Path $PSScriptRoot "..\Data\CollectionInventory_$(Get-Date -Format 'yyyyMMdd-HHmm').csv")
+    [string]$OutputPath = (Join-Path $PSScriptRoot "..\Data\CollectionInventory_$(Get-Date -Format 'yyyyMMdd-HHmm').csv"),
+    [string[]]$ExcludeNameSuffix = @('-sec'),
+    [string[]]$ExcludeLimitedTo  = @('LEA013D0')
 )
 
 $ErrorActionPreference = 'Stop'
@@ -96,6 +117,26 @@ try {
     function Format-CollectionRef([string]$Id) {
         $name = $namesById[$Id]
         if ($name) { "$name ($Id)" } else { "<unknown> ($Id)" }
+    }
+
+    # Console folder, e.g. "Device Collections\Workstations\Office". ObjectPath is "/" at the root.
+    function Format-ConsolePath($Collection) {
+        if ($null -eq $Collection.CimInstanceProperties['ObjectPath']) { return '' }   # site older than CM 1906
+        $root = switch ($Collection.CollectionType) { 1 { 'User Collections' } 2 { 'Device Collections' } default { 'Collections' } }
+        $folder = "$($Collection.ObjectPath)".Trim('/') -replace '/', '\'
+        if ($folder) { "$root\$folder" } else { $root }
+    }
+
+    # Decide exclusions up front. Excluded collections are still read below for their
+    # references, but get no row in the CSV.
+    $excludedReason = @{}   # collection ID -> reason
+    foreach ($c in $collections) {
+        $name = "$($c.Name)".TrimEnd()
+        $reason =
+            if ($c.CollectionID -like 'SMS*') { 'Built-in' }
+            elseif (@($ExcludeNameSuffix | Where-Object { $_ -and $name.EndsWith($_, [StringComparison]::OrdinalIgnoreCase) }).Count) { 'Name suffix' }
+            elseif ($c.LimitToCollectionID -and $ExcludeLimitedTo -contains $c.LimitToCollectionID) { 'Limiting collection' }
+        if ($reason) { $excludedReason[$c.CollectionID] = $reason }
     }
 
     # Structured reference tracking. Filled during the main loop, read after it.
@@ -166,13 +207,21 @@ try {
             }
         }
 
+        # References from this collection are recorded above; excluded collections stop here.
+        if ($excludedReason.ContainsKey($c.CollectionID)) { continue }
+
         $deployments = @($deploymentsById[$c.CollectionID] | Where-Object { $_ })
 
         $refreshName = $RefreshTypes[[int]$c.RefreshType]
         if (-not $refreshName) { $refreshName = "Unknown ($($c.RefreshType))" }
 
+        # ReferencedByCount and ReferencedBy are filled in the second pass. They sit next to
+        # the name so the dependency check is visible while reviewing.
         [pscustomobject]@{
             CollectionName       = $c.Name
+            ReferencedByCount    = 0
+            ReferencedBy         = ''
+            ObjectPath           = Format-ConsolePath $c
             CollectionID         = $c.CollectionID
             Type                 = switch ($c.CollectionType) { 1 { 'User' } 2 { 'Device' } default { 'Other' } }
             MemberCount          = $c.MemberCount
@@ -201,11 +250,10 @@ try {
     # The blank review column goes first so it is easy to find when marking rows in Excel.
     # Enter Y in that column to mark a collection for deletion (see Delete-MarkedCollections.ps1).
     $results = foreach ($row in $rows) {
-        $list  = $referencedBy[$row.CollectionID]
-        $count = if ($list) { $list.Count } else { 0 }
-        $row | Add-Member -NotePropertyName ReferencedByCount -NotePropertyValue $count -PassThru |
-            Add-Member -NotePropertyName ReferencedBy -NotePropertyValue (@($list) -join $Separator) -PassThru |
-            Select-Object @{ Name = 'to be deleted'; Expression = { '' } }, *
+        $list = $referencedBy[$row.CollectionID]
+        $row.ReferencedByCount = if ($list) { $list.Count } else { 0 }
+        $row.ReferencedBy      = @($list) -join $Separator
+        $row | Select-Object @{ Name = 'to be deleted'; Expression = { '' } }, *
     }
 
     $outDir = Split-Path -Parent $OutputPath
@@ -223,6 +271,8 @@ try {
 
     $incrementalCount = @($results | Where-Object { $_.IsIncremental }).Count
     Write-Host "Exported $(@($results).Count) collections to $((Resolve-Path $OutputPath).Path)"
+    $byReason = ($excludedReason.Values | Group-Object | Sort-Object Name | ForEach-Object { "$($_.Name): $($_.Count)" }) -join ', '
+    Write-Host "Excluded $($excludedReason.Count) collections$(if ($byReason) { " ($byReason)" })."
     Write-Host "Exported $($references.Count) references to $refPath"
     Write-Host "Incremental evaluation enabled on $incrementalCount collections."
 }
