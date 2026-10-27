@@ -4,14 +4,15 @@
     Preview only by default. Pass -Execute to delete.
 
 .DESCRIPTION
-    Reads a CollectionInventory CSV produced by Collection-Inventory.v2.ps1 and selects rows
+    Reads a CollectionInventory CSV produced by Collection-Inventory.v4.ps1 and selects rows
     where 'to be deleted' is Y (case-insensitive, surrounding spaces ignored). Every selected
     row is checked against the LIVE site before anything is deleted, because the CSV can be
     out of date:
 
       - Built-in collections (IDs starting with SMS) are never deleted.
       - The collection must still exist, and its name must match the CSV.
-      - The collection must have no deployments.
+      - The collection must have no deployments, including client settings and antimalware
+        policy deployments.
       - No other collection may reference it (limiting, include, exclude, or query text).
       - The CSV must not list the same collection ID twice.
 
@@ -102,7 +103,7 @@ if (-not (Test-Path $InputPath)) { throw "Input file not found: $InputPath" }
 $inventory = @(Import-Csv -Path $InputPath -Encoding UTF8)
 if ($inventory.Count -eq 0) { throw "Input file has no rows: $InputPath" }
 if (-not ($inventory[0].PSObject.Properties.Name -contains $ReviewColumn)) {
-    throw "Column '$ReviewColumn' not found in $InputPath. Use a file produced by Collection-Inventory.v2.ps1."
+    throw "Column '$ReviewColumn' not found in $InputPath. Use a file produced by Collection-Inventory.v4.ps1."
 }
 
 $marked = @($inventory | Where-Object { "$($_.$ReviewColumn)".Trim() -ieq 'Y' })
@@ -161,6 +162,19 @@ try {
         $deployedIds[$d.CollectionID] = $true
     }
 
+    # Client settings and antimalware policy deployments are not in SMS_DeploymentSummary.
+    # Deleting the collection would silently remove them. Collection ID -> settings names.
+    $settingsNames = @{}
+    foreach ($cs in Get-CimInstance -CimSession $session -Namespace $namespace -ClassName SMS_ClientSettingsBase) {
+        $settingsNames[[uint32]$cs.SettingsID] = $cs.Name
+    }
+    $clientSettingsById = @{}
+    foreach ($a in Get-CimInstance -CimSession $session -Namespace $namespace -ClassName SMS_ClientSettingsAssignment) {
+        if (-not $clientSettingsById.ContainsKey($a.CollectionID)) { $clientSettingsById[$a.CollectionID] = New-Object System.Collections.Generic.List[string] }
+        $name = $settingsNames[[uint32]$a.ClientSettingsID]
+        $clientSettingsById[$a.CollectionID].Add($(if ($name) { $name } else { "ID $($a.ClientSettingsID)" }))
+    }
+
     # ---------- validate each marked row ----------
 
     $toDelete = New-Object System.Collections.Generic.List[pscustomobject]
@@ -183,6 +197,10 @@ try {
         if (-not $live)                        { Skip-Row $id $name 'Not found in site (already deleted?)'; continue }
         if ($live.Name -ne $name)              { Skip-Row $id $name "Name mismatch: site has '$($live.Name)'. Re-run inventory."; continue }
         if ($deployedIds.ContainsKey($id))     { Skip-Row $id $name 'Has deployments'; continue }
+        if ($clientSettingsById.ContainsKey($id)) {
+            Skip-Row $id $name "Has client settings deployments: $($clientSettingsById[$id] -join '; ')"
+            continue
+        }
 
         $sources = @($referencedBy[$id] | Where-Object { $_ -and $_ -ne $id })
         if ($sources.Count -gt 0) {
