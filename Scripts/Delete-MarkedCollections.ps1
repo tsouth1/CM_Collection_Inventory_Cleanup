@@ -164,23 +164,30 @@ try {
     # ---------- validate each marked row ----------
 
     $toDelete = New-Object System.Collections.Generic.List[pscustomobject]
+    $skipped  = New-Object System.Collections.Generic.List[pscustomobject]
+
+    # Log a skipped row and keep it for the on-screen summary.
+    function Skip-Row([string]$Id, [string]$Name, [string]$Reason) {
+        Write-Log 'Skipped' $Id $Name $Reason
+        $skipped.Add([pscustomobject]@{ CollectionID = $Id; CollectionName = $Name; Reason = $Reason })
+    }
 
     foreach ($row in $marked) {
         $id   = "$($row.CollectionID)".Trim()
         $name = "$($row.CollectionName)"
 
-        if ($dupeIds -contains $id)           { Write-Log 'Skipped' $id $name 'Duplicate ID in CSV'; continue }
-        if ($id -match '^SMS')                 { Write-Log 'Skipped' $id $name 'Built-in collection'; continue }
+        if ($dupeIds -contains $id)           { Skip-Row $id $name 'Duplicate ID in CSV'; continue }
+        if ($id -match '^SMS')                 { Skip-Row $id $name 'Built-in collection'; continue }
 
         $live = $liveById[$id]
-        if (-not $live)                        { Write-Log 'Skipped' $id $name 'Not found in site (already deleted?)'; continue }
-        if ($live.Name -ne $name)              { Write-Log 'Skipped' $id $name "Name mismatch: site has '$($live.Name)'. Re-run inventory."; continue }
-        if ($deployedIds.ContainsKey($id))     { Write-Log 'Skipped' $id $name 'Has deployments'; continue }
+        if (-not $live)                        { Skip-Row $id $name 'Not found in site (already deleted?)'; continue }
+        if ($live.Name -ne $name)              { Skip-Row $id $name "Name mismatch: site has '$($live.Name)'. Re-run inventory."; continue }
+        if ($deployedIds.ContainsKey($id))     { Skip-Row $id $name 'Has deployments'; continue }
 
         $sources = @($referencedBy[$id] | Where-Object { $_ -and $_ -ne $id })
         if ($sources.Count -gt 0) {
             $srcNames = ($sources | ForEach-Object { $liveById[$_].Name }) -join '; '
-            Write-Log 'Skipped' $id $name "Referenced by: $srcNames"
+            Skip-Row $id $name "Referenced by: $srcNames"
             continue
         }
 
@@ -188,6 +195,12 @@ try {
     }
 
     # ---------- preview ----------
+
+    if ($skipped.Count -gt 0) {
+        Write-Host ''
+        Write-Host "Skipped $($skipped.Count) collection(s):" -ForegroundColor Yellow
+        $skipped | Format-Table -AutoSize -Wrap
+    }
 
     Write-Host ''
     Write-Host "Will delete $($toDelete.Count) collection(s):"
